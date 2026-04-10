@@ -1,25 +1,17 @@
 """
-Entraînement du modèle de distribution d'espèces GLC25
-=======================================================
+Entraînement GLC25 — modèle image ResNet18
+==========================================
 
-Usage
+Usage (serveur NVIDIA)
 -----
-# Modèle de fusion (image + tabulaire) — recommandé
-python models/train.py
-
-# Baseline tabulaire seulement (plus rapide)
-python models/train.py --model tabular
-
-# Vérification rapide (2 epochs, subset)
-python models/train.py --fast-dev
-
-# Forcer un GPU spécifique (sinon auto-sélection du GPU le plus libre)
-python models/train.py --gpu 2
+python models/train.py                         # auto-sélection GPU le plus libre
+python models/train.py --gpu 2                 # forcer GPU 2
+python models/train.py --fast-dev              # 2 epochs, 2% des données
 
 Contraintes serveur
 -------------------
-4 GPUs × 11 264 MiB disponibles → on utilise 1 GPU (auto-sélectionné).
-Avec ResNet18 + batch_size=64 + fp16 → ~3-4 GB VRAM.
+1 GPU RTX 3090 (24 576 MiB) dédié au groupe.
+ResNet18 + batch_size=128 + fp16 → ~5-6 GB VRAM.
 """
 
 import argparse
@@ -31,16 +23,25 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import (
-    ModelCheckpoint,
-    EarlyStopping,
-    LearningRateMonitor,
-)
-from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.loggers import TensorBoardLogger
 
-# ── Racine du projet ──────────────────────────────────────────────────────────
+try:
+    import tensorboard as _tb
+    _TENSORBOARD_AVAILABLE = True
+except ImportError:
+    try:
+        import tensorboardX as _tb
+        _TENSORBOARD_AVAILABLE = True
+    except ImportError:
+        _TENSORBOARD_AVAILABLE = False
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+
+from models.dataset import build_datasets
+from models.model import GLC25ImageSystem
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,10 +49,7 @@ sys.path.insert(0, ROOT)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def select_free_gpu() -> int:
-    """
-    Interroge nvidia-smi et retourne l'index du GPU avec le plus de VRAM libre.
-    Fallback sur GPU 0 si nvidia-smi n'est pas disponible.
-    """
+    """Retourne l'index du GPU NVIDIA avec le plus de VRAM libre."""
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
@@ -59,45 +57,31 @@ def select_free_gpu() -> int:
         )
         free_mem = [int(x.strip()) for x in result.stdout.strip().split("\n")]
         best = int(np.argmax(free_mem))
-        print(f"[GPU] Auto-sélection → GPU {best} "
-              f"({free_mem[best]} MiB libres | "
-              f"autres : {[f'GPU{i}={m}MiB' for i, m in enumerate(free_mem) if i != best]})")
+        print(f"[GPU] GPU {best} sélectionné ({free_mem[best]} MiB libres)")
         return best
-    except Exception as e:
-        print(f"[GPU] nvidia-smi indisponible ({e}), fallback GPU 0")
+    except Exception:
         return 0
-
-from models.dataset import build_datasets
-from models.model import GLC25FusionSystem, TabularOnlySystem
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration par défaut
+# Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULTS = {
-    # Données
-    "data_root":       ROOT,
-    "val_fraction":    0.1,
-    "num_workers":     8,       # threads DataLoader
-    "seed":            42,
-
-    # Entraînement
-    "batch_size":      64,      # OK pour ResNet50 + fp16 sur 11 GB
-    "max_epochs":      30,
-    "lr":              1e-4,
-    "weight_decay":    1e-4,
-    "dropout":         0.4,
-
-    # Modèle
-    "tab_hidden":      256,
-    "head_hidden":     512,
-    "pretrained":      True,
-    "pos_weight":      None,    # float ou None
-
-    # Checkpoints
-    "ckpt_dir":        os.path.join(ROOT, "checkpoints"),
-    "log_dir":         os.path.join(ROOT, "logs"),
+    "data_root":    ROOT,
+    "val_fraction": 0.2,
+    "num_workers":  8,
+    "seed":         42,
+    "batch_size":   128,
+    "max_epochs":   100,
+    "lr":           1e-4,
+    "weight_decay": 1e-4,
+    "dropout":      0.3,
+    "threshold":    0.3,
+    "pretrained":   True,
+    "pos_weight":   10.0,   # poids des positifs dans BCE (espèces rares)
+    "ckpt_dir":     os.path.join(ROOT, "checkpoints"),
+    "log_dir":      os.path.join(ROOT, "logs"),
 }
 
 
@@ -107,36 +91,40 @@ DEFAULTS = {
 
 class GLC25DataModule(pl.LightningDataModule):
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, max_surveys: int = None):
         super().__init__()
         self.cfg = cfg
+        self.max_surveys = max_surveys
 
     def setup(self, stage=None):
         self.train_ds, self.val_ds, self.meta = build_datasets(
             data_root=self.cfg["data_root"],
             val_fraction=self.cfg["val_fraction"],
             seed=self.cfg["seed"],
+            max_surveys=self.max_surveys,
         )
 
     def train_dataloader(self):
+        pin = self.cfg.get("pin_memory", True)
         return DataLoader(
             self.train_ds,
             batch_size=self.cfg["batch_size"],
             shuffle=True,
             num_workers=self.cfg["num_workers"],
-            pin_memory=True,
-            persistent_workers=True,
+            pin_memory=pin,
+            persistent_workers=self.cfg["num_workers"] > 0,
             drop_last=True,
         )
 
     def val_dataloader(self):
+        pin = self.cfg.get("pin_memory", True)
         return DataLoader(
             self.val_ds,
-            batch_size=self.cfg["batch_size"] * 2,   # pas de gradient → double batch
+            batch_size=self.cfg["batch_size"] * 2,
             shuffle=False,
             num_workers=self.cfg["num_workers"],
-            pin_memory=True,
-            persistent_workers=True,
+            pin_memory=pin,
+            persistent_workers=self.cfg["num_workers"] > 0,
         )
 
 
@@ -144,166 +132,138 @@ class GLC25DataModule(pl.LightningDataModule):
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_callbacks(cfg: dict, monitor: str = "val/F1"):
+class EpochSummary(pl.Callback):
+    """Affiche un tableau récapitulatif à chaque fin d'epoch."""
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Lit les accumulateurs du modèle avant qu'ils soient vidés
+        # (les callbacks s'exécutent avant on_validation_epoch_end du LightningModule)
+        if not pl_module._val_f1_scores:
+            return
+        import torch as _torch
+        mean_f1   = _torch.stack(pl_module._val_f1_scores).mean().item()
+        mean_loss = _torch.stack(pl_module._val_losses).mean().item()
+        epoch = trainer.current_epoch
+        lr    = trainer.optimizers[0].param_groups[0]["lr"]
+        print(
+            f"\n  Epoch {epoch:>3} │ "
+            f"val/loss={mean_loss:.5f} │ "
+            f"val/F1={mean_f1:.5f} │ "
+            f"lr={lr:.2e}"
+        )
+
+
+def build_callbacks(cfg: dict):
     os.makedirs(cfg["ckpt_dir"], exist_ok=True)
     return [
         ModelCheckpoint(
             dirpath=cfg["ckpt_dir"],
-            filename="glc25-{epoch:02d}-{val/mAP:.4f}",
-            monitor=monitor,
+            filename="glc25-{epoch:02d}-{val_F1:.4f}",
+            monitor="val/F1",
             mode="max",
             save_top_k=3,
             save_last=True,
-            verbose=True,
         ),
-        EarlyStopping(
-            monitor=monitor,
-            mode="max",
-            patience=6,
-            verbose=True,
-        ),
+        EarlyStopping(monitor="val/F1", mode="max", patience=25),
         LearningRateMonitor(logging_interval="step"),
+        EpochSummary(),
     ]
 
 
 def build_loggers(cfg: dict, name: str):
     os.makedirs(cfg["log_dir"], exist_ok=True)
-    return [
-        TensorBoardLogger(cfg["log_dir"], name=name),
-        CSVLogger(cfg["log_dir"], name=name),
-    ]
+    loggers = [CSVLogger(cfg["log_dir"], name=name)]
+    if _TENSORBOARD_AVAILABLE:
+        loggers.append(TensorBoardLogger(cfg["log_dir"], name=name))
+    return loggers
 
 
-def build_trainer(cfg: dict, name: str, fast_dev: bool = False) -> pl.Trainer:
+def build_trainer(cfg: dict, accelerator: str, fast_dev: bool = False) -> pl.Trainer:
     return pl.Trainer(
-        # ── GPU : 1 seul (1/4 du serveur) ────────────────────────────────
-        accelerator="gpu",
+        accelerator=accelerator,
         devices=1,
-        # ── Précision mixte fp16 (économise ~40% VRAM) ───────────────────
-        precision="16-mixed",
-        # ── Durée ────────────────────────────────────────────────────────
+        precision="16-mixed" if accelerator == "gpu" else "32",
         max_epochs=2 if fast_dev else cfg["max_epochs"],
         limit_train_batches=0.02 if fast_dev else 1.0,
         limit_val_batches=0.1  if fast_dev else 1.0,
-        # ── Callbacks & logs ─────────────────────────────────────────────
         callbacks=build_callbacks(cfg),
-        logger=build_loggers(cfg, name),
-        # ── Optimisations ────────────────────────────────────────────────
+        logger=build_loggers(cfg, "image_only"),
         gradient_clip_val=1.0,
         log_every_n_steps=20,
-        # ── Reproductibilité ─────────────────────────────────────────────
-        deterministic=False,    # True ralentit ~30%
         enable_progress_bar=True,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entraînement fusion (image + tabulaire)
+# Entraînement
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train_fusion(cfg: dict, fast_dev: bool = False):
+def train(cfg: dict, accelerator: str = "gpu", fast_dev: bool = False):
     pl.seed_everything(cfg["seed"], workers=True)
 
-    print("\n══════════════════════════════════════════")
-    print("   GLC25 — Modèle de fusion (ResNet18 + MLP)")
-    print("══════════════════════════════════════════\n")
+    print("\n══════════════════════════════════════")
+    print("   GLC25 — ResNet18 4 canaux (image)")
+    print(f"   Accélérateur : {accelerator}")
+    print("══════════════════════════════════════\n")
 
-    # ── DataModule ────────────────────────────────────────────────────────
     dm = GLC25DataModule(cfg)
     dm.setup()
     meta = dm.meta
 
-    print(f"Espèces        : {meta['num_classes']}")
-    print(f"Features tab   : {meta['n_tab_features']}")
-    print(f"GPU utilisé    : {os.environ.get('CUDA_VISIBLE_DEVICES', '0')} (1/4 du serveur)\n")
-
-    # ── Modèle ───────────────────────────────────────────────────────────
-    model = GLC25FusionSystem(
+    model = GLC25ImageSystem(
         num_classes=meta["num_classes"],
-        n_tab_features=meta["n_tab_features"],
         lr=cfg["lr"],
         weight_decay=cfg["weight_decay"],
-        tab_hidden=cfg["tab_hidden"],
-        head_hidden=cfg["head_hidden"],
         dropout=cfg["dropout"],
-        pretrained_image=cfg["pretrained"],
+        threshold=cfg["threshold"],
+        pretrained=cfg["pretrained"],
         pos_weight=cfg["pos_weight"],
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Paramètres     : {n_params / 1e6:.1f}M")
+    print(f"Espèces      : {meta['num_classes']}")
+    print(f"Paramètres   : {n_params / 1e6:.1f}M")
 
-    # ── Trainer ──────────────────────────────────────────────────────────
-    trainer = build_trainer(cfg, name="fusion", fast_dev=fast_dev)
-    trainer.fit(model, datamodule=dm)
+    trainer = build_trainer(cfg, accelerator=accelerator, fast_dev=fast_dev)
+    trainer.fit(model, datamodule=dm, ckpt_path=cfg.get("resume"))
 
     best = trainer.checkpoint_callback.best_model_path
     print(f"\nMeilleur checkpoint : {best}")
-    return model, dm, best
+    return model, best
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entraînement baseline tabulaire seulement
-# ─────────────────────────────────────────────────────────────────────────────
-
-def train_tabular_only(cfg: dict, fast_dev: bool = False):
-    pl.seed_everything(cfg["seed"], workers=True)
-
-    print("\n══════════════════════════════════════════")
-    print("   GLC25 — Baseline tabulaire (MLP seul)")
-    print("══════════════════════════════════════════\n")
-
-    dm = GLC25DataModule(cfg)
-    dm.setup()
-    meta = dm.meta
-
-    model = TabularOnlySystem(
-        num_classes=meta["num_classes"],
-        n_tab_features=meta["n_tab_features"],
-        lr=3e-4,
-    )
-
-    trainer = build_trainer(cfg, name="tabular_only", fast_dev=fast_dev)
-    trainer.fit(model, datamodule=dm)
-    return model, dm
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
+# CLI (serveur NVIDIA)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Entraînement GLC25")
-    p.add_argument("--model",       choices=["fusion", "tabular"], default="fusion")
-    p.add_argument("--fast-dev",    action="store_true", help="2 epochs, subset de données")
+    p = argparse.ArgumentParser(description="Entraînement GLC25 — serveur NVIDIA")
+    p.add_argument("--fast-dev",    action="store_true")
     p.add_argument("--batch-size",  type=int,   default=DEFAULTS["batch_size"])
     p.add_argument("--epochs",      type=int,   default=DEFAULTS["max_epochs"])
     p.add_argument("--lr",          type=float, default=DEFAULTS["lr"])
     p.add_argument("--workers",     type=int,   default=DEFAULTS["num_workers"])
     p.add_argument("--gpu",         type=int,   default=None,
-                   help="Index du GPU à utiliser (0-3). Si absent : auto-sélection du GPU le plus libre.")
-    p.add_argument("--no-pretrain", action="store_true", help="Désactiver ImageNet weights")
+                   help="Index GPU (0-3). Absent = auto-sélection du GPU le plus libre.")
+    p.add_argument("--no-pretrain", action="store_true")
+    p.add_argument("--resume",      type=str, default=None,
+                   help="Chemin vers un checkpoint .ckpt pour reprendre l'entraînement.")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    # ── Sélection GPU ─────────────────────────────────────────────────────────
     gpu_idx = args.gpu if args.gpu is not None else select_free_gpu()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+    print(f"[GPU] CUDA_VISIBLE_DEVICES={gpu_idx}")
 
-    cfg = {**DEFAULTS}
-    cfg["batch_size"]  = args.batch_size
-    cfg["max_epochs"]  = args.epochs
-    cfg["lr"]          = args.lr
-    cfg["num_workers"] = args.workers
-    cfg["pretrained"]  = not args.no_pretrain
+    cfg = {**DEFAULTS,
+           "batch_size":  args.batch_size,
+           "max_epochs":  args.epochs,
+           "lr":          args.lr,
+           "num_workers": args.workers,
+           "pretrained":  not args.no_pretrain,
+           "resume":      args.resume}
 
-    if not torch.cuda.is_available():
-        print("[AVERTISSEMENT] Aucun GPU détecté — passage en mode CPU (lent)")
-
-    if args.model == "fusion":
-        train_fusion(cfg, fast_dev=args.fast_dev)
-    else:
-        train_tabular_only(cfg, fast_dev=args.fast_dev)
+    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+    train(cfg, accelerator=accelerator, fast_dev=args.fast_dev)
