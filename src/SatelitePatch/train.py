@@ -40,8 +40,8 @@ except ImportError:
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from models.dataset import build_datasets
-from models.model import GLC25ImageSystem
+from src.SatelitePatch.dataset import build_datasets
+from src.SatelitePatch.model import GLC25ImageSystem
 
 
 # ─────────────────────────────────────────────────────────────────────────────

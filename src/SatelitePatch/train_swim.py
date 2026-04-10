@@ -43,8 +43,8 @@ except ImportError:
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from models.dataset import build_datasets
-from models.model_swin import GLC25SwinSystem
+from src.SatelitePatch.dataset import build_datasets
+from src.SatelitePatch.model_swin import GLC25SwinSystem
 
 
 # ─────────────────────────────────────────────────────────────────────────────

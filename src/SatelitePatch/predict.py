@@ -18,8 +18,8 @@ Format de sortie (identique à GLC25_SAMPLE_SUBMISSION.csv) :
 
 import argparse
 import os
-import sys
 import subprocess
+import sys
 from datetime import datetime
 
 import numpy as np
@@ -30,8 +30,10 @@ from torch.utils.data import Dataset, DataLoader
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from models.dataset import GLC25ImageDataset, survey_to_tiff_path
-from models.model import GLC25ImageSystem
+from src.SatelitePatch.dataset import GLC25ImageDataset, survey_to_tiff_path
+from src.SatelitePatch.model import GLC25ImageSystem
+from src.SatelitePatch.model_swin import GLC25SwinSystem
+
 
 def select_free_gpu() -> int:
     """Retourne l'index du GPU NVIDIA avec le plus de VRAM libre."""
@@ -55,6 +57,7 @@ def select_free_gpu() -> int:
 def find_data_root(script_root: str) -> str:
     """Trouve le dossier data/ en testant plusieurs emplacements (Mac / serveur)."""
     candidates = [
+        os.path.join(script_root, "data"),
         os.path.join(script_root, "..", "..", "data", "challenge2026MIASHS"),
     ]
     for c in candidates:
@@ -63,7 +66,7 @@ def find_data_root(script_root: str) -> str:
     raise FileNotFoundError(f"Dossier data/ introuvable. Chemins testés : {candidates}")
 
 
-def build_test_dataset(data_root: str) -> GLC25ImageDataset:
+def build_test_dataset(data_root: str, image_size: int = 64) -> GLC25ImageDataset:
     """Construit le dataset PA-test (sans labels)."""
     data_dir    = find_data_root(data_root)
     meta        = pd.read_csv(os.path.join(data_dir, "GLC25_PA_metadata_test.csv"))
@@ -74,6 +77,7 @@ def build_test_dataset(data_root: str) -> GLC25ImageDataset:
         labels=None,
         patches_dir=patches_dir,
         augment=False,
+        image_size=image_size,
     )
 
 
@@ -142,6 +146,8 @@ def parse_args():
     p.add_argument("--workers",    type=int, default=8)
     p.add_argument("--gpu",        type=int, default=None,
                    help="Index GPU (défaut: auto-sélection du GPU le plus libre)")
+    p.add_argument("--model",      type=str, default="resnet", choices=["resnet", "swin"],
+                   help="Architecture du checkpoint : resnet (défaut) ou swin")
     return p.parse_args()
 
 
@@ -161,7 +167,8 @@ if __name__ == "__main__":
 
     # Modèle
     print(f"[Checkpoint] {args.checkpoint}")
-    model = GLC25ImageSystem.load_from_checkpoint(args.checkpoint, map_location=device)
+    ModelClass = GLC25SwinSystem if args.model == "swin" else GLC25ImageSystem
+    model = ModelClass.load_from_checkpoint(args.checkpoint, map_location=device)
 
     # Liste des espèces (depuis les métadonnées train)
     _data_dir  = find_data_root(ROOT)
@@ -171,7 +178,8 @@ if __name__ == "__main__":
     print(f"[Espèces] {len(species_list)}")
 
     # Dataset test
-    test_ds = build_test_dataset(ROOT)
+    image_size = 224 if args.model == "swin" else 64
+    test_ds = build_test_dataset(ROOT, image_size=image_size)
     test_dl = DataLoader(
         test_ds,
         batch_size=args.batch_size,

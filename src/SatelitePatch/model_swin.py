@@ -25,7 +25,7 @@ try:
 except ImportError:
     raise ImportError("timm requis : pip install timm")
 
-from models.model import f1_samples
+from src.SatelitePatch.model import f1_samples
 
 
 # ─────────────────────────────────────────────────────────────────────────────
